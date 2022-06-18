@@ -1,143 +1,186 @@
-#include <PID_v2.h>
+#include <PID_v1.h>
 #include <LiquidCrystal_I2C.h>
-
+#include <SimpleKalmanFilter.h>
 LiquidCrystal_I2C lcd(0x27, 20, 4);
+SimpleKalmanFilter antiJamming(2, 2, 0.1);
 
-#define BT    A0
+#define BT    A3
 #define BT1   A1 
 #define BT2   A2 
-#define LM35  A3
-#define relay 11
-#define pwm   10
-#define in1   9
-#define in2   8
+#define relay 8
+// #define pwm   10
+// #define in1   9
+// #define in2   8
 
-unsigned long PID_TIME = 3000;
+// Analog output pin
+#define outputPin 9
 
-double set_point ; // will be the desired value
-double input_lm35; // Sensor lm35
-double output ; //LED
-double kp = 3.6, ki = 0, kd = 206 ; //PID parameters
-PID myPID(&input_lm35, &output, &set_point, kp, ki, kd, DIRECT); //create PID instance
- 
+// thermistor analog pin
+#define THERMISTORPIN A0
+// how many samples to take and average
+#define NUMSAMPLES 5
+// how long between pid/sampling
+#define SAMPLETIME 1000
+//Define Variables we'll be connecting to
+double Setpoint, currentTemp, Output;
+//Specify the links and initial tuning parameters
+double kp = 15, ki =.3, kd = 0; //PID parameters
+PID myPID(&currentTemp, &Output, &Setpoint, kp, ki, kd, DIRECT);
+int lastTemp = 0;
 int mode = 0;
-int setup_temperature;
-unsigned long timer_1 = 0;
+int setupTemperature,gt_filter;
+int TOLERANCE_TEMP = 5;
 
 void setup() {
-  Serial.begin(9600);  
+  Serial.begin(9600);
+  analogReference(EXTERNAL);
+  pinMode(outputPin, OUTPUT);
+  
+  //initialize PID setpoint *C
+  //Setpoint = 0;
+
+  //turn the PID on
+  myPID.SetMode(AUTOMATIC);
+  myPID.SetSampleTime(SAMPLETIME);
+  myPID.SetTunings(kp, ki, kd);
+  myPID.SetOutputLimits(0,255);
+  //pid Autotuner
 
   // Pin input
   // pinMode (LM35, INPUT);
   pinMode (BT1,INPUT_PULLUP);
   pinMode (BT2,INPUT_PULLUP);
   pinMode (BT,INPUT);
-
-  // Pin output
-  pinMode (relay, OUTPUT);
-  pinMode (pwm,  OUTPUT);
-  pinMode (in1, OUTPUT);
-  pinMode (in2,  OUTPUT);
   
+  pinMode (relay, OUTPUT);
+ 
   // LCD init
   lcd.init();
   lcd.backlight();
 
-  // PID init
-  myPID.SetMode(AUTOMATIC);
-  myPID.SetTunings(kp, ki, kd);
-  myPID.SetSampleTime(PID_TIME);
-  myPID.SetOutputLimits(0,255);
-
-
-  // Set chiều quay cho quạt
-  digitalWrite(in1, LOW);
-  digitalWrite(in2, HIGH);
-
 }
 
 void loop() {
-  button();
-  setup_mode();
-  if(mode == 1)
-  {
-    control_temperature();
-    write_lcd(4, 0, "OPERATION");
+  buttonChangeMode();
+  setupMode();
+
+  if(mode == 1) {
+    write_lcd(6, 0, "OPERATION");
     write_lcd(0, 1, "TEMP:");
-    button();
+    getTemperature();
+    buttonChangeMode();
   }
 }
-//================================================
-void button(){
-  if(digitalRead(BT1) == 0) 
-  {
-    delay(500);
+////////////////////////////////////////////////////////////////
+void getTemperature(){
+  uint8_t i;
+  double average = 0;
+  
+  Setpoint = setupTemperature;
+  
+  buttonChangeMode();
+
+  if (Serial.available() > 0) {
+    // get incoming byte:
+    Setpoint = Serial.parseFloat();
+  }
+  
+  // take N samples in a row, with a slight delay
+  for (i = 0; i < NUMSAMPLES; i++) {
+    average += analogRead(THERMISTORPIN);
+    delay(10);
+  }
+
+  average /= NUMSAMPLES;
+  currentTemp=resistanceToC(inputToResistance(average));
+  turnOnRelay(currentTemp, lastTemp);
+  
+  myPID.Compute();
+
+  analogWrite(outputPin, Output);
+
+  lcd.setCursor(5, 1);
+  lcd.print(currentTemp);
+  
+  lastTemp = currentTemp;
+  delay(SAMPLETIME);  
+}
+//////////////////////////////////////////////////////////////////////////////
+void buttonChangeMode() {
+  if(digitalRead(BT1) == 0) {
+    delay(300);
     lcd.clear();
     mode++;
     if(mode > 1) mode = 0;
-  }
+  }  
 }
-//================================================
-void setup_mode()
+//////////////////////////////////////////////////////////////////////////////
+void setupMode()
 {
-  if(mode == 0)
-  {
+  buttonChangeMode();
+  //lcd.clear();
+  if(mode == 0) {
+
     write_lcd(0, 1, "TEMP:");
     write_lcd(6, 0, "SETUP");
-
-    analogWrite(pwm, 0);
-
-    setup_temperature = map(analogRead(BT), 0, 1023, 0, 100);
+    Serial.write('0');
+    analogWrite(outputPin, 0);
+    digitalWrite(relay, LOW); 
+   
+    gt_filter = antiJamming.updateEstimate(analogRead(BT));
+    setupTemperature = map(gt_filter, 0, 1023, 0, 200);
 
     lcd.setCursor(5, 1);
-    lcd.print(setup_temperature/10%10);
-    lcd.print(setup_temperature%10);
+    if((setupTemperature/100%10)!=0) lcd.print(setupTemperature/100%10);  
+    else lcd.print(' '); 
+    lcd.print(setupTemperature/10%10);
+    lcd.print(setupTemperature%10);
   }
 }
-//========================================
-void control_temperature()
-{
-  set_point = setup_temperature;
-  float read_temp = read_lm35();
-  myPID.Compute();
-
-  if((millis() - timer_1) > PID_TIME)
-  {
-    if(read_temp >= setup_temperature)
-    {  
-      analogWrite(pwm,100);
-      write_lcd(11, 1, "FAN:MIN");
-     
-    } 
-    else
-    {
-      analogWrite(pwm,255);
-      write_lcd(11, 1, "FAN:MAX");
-  
-    }
-    
-    int xung = constrain((int)output,0,255);
-    analogWrite(relay,xung); 
-
-    timer_1 = millis();
+//////////////////////////////////////////////////////////////////////////////
+void turnOnRelay(int temp, int lastTemp) {
+  int minTemp = setupTemperature - TOLERANCE_TEMP;
+  int maxTemp = setupTemperature + TOLERANCE_TEMP;
+  if((temp > minTemp && temp < maxTemp) && (lastTemp > minTemp && lastTemp < maxTemp)) {
+    digitalWrite(relay, HIGH);
+    Serial.write('1');
+  } 
+  else {
+    digitalWrite(relay, LOW);
+    Serial.write('0');
   }
-}
 
-//========================================
+}
+//////////////////////////////////////////////////////////////////////////////
 void write_lcd(int x, int y, char content[])
 {
   lcd.setCursor(x, y);
   lcd.print(content);
 }
-//========================================
-float read_lm35(){
-  input_lm35 = analogRead(LM35);
-  float voltage = input_lm35 * 5.0 / 1024.0;
-  float temp = voltage * 100.0;
-  delay(1000);
-  lcd.setCursor(5, 1);
-  lcd.print(temp);
-  Serial.print(temp);
-  return temp;
+/*////////////////////////////////////////////////////////////////////////////
+  Funtion to convert the input value to resistance  
+  The value of the 'other' resistor
+*/
+double inputToResistance(double input) {
+  double SERIESRESISTOR = 10000;
+  input = 1023 / input - 1;
+  return SERIESRESISTOR / input;
 }
-
+/*///////////////////////////////////////////////////////////////////////////
+  Funtion to convert resistance to c
+  Temp/resistance for nominal
+*/
+double resistanceToC(double resistance) {
+  double THERMISTORNOMINAL = 118000;
+  double TEMPERATURENOMINAL = 25;
+  // beta coefficent
+  double BCOEFFICIENT = 3950;
+  double steinhart;
+  steinhart = resistance / THERMISTORNOMINAL; // (R/Ro)
+  steinhart = log(steinhart); // ln(R/Ro)
+  steinhart /= BCOEFFICIENT; // 1/B * ln(R/Ro)
+  steinhart += 1.0 / (TEMPERATURENOMINAL + 273.15); // + (1/To)
+  steinhart = 1.0 / steinhart; // Invert
+  steinhart -= 273.15; // convert to C
+  return steinhart;
+}
